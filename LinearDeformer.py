@@ -154,25 +154,59 @@ class LinearDeformer(object):
         x = ((r1 * (xp - xc)) / r1p) + xc
         y = ((r1 * (yp - yc)) / r1p) + yc
         return x, y
-    
+    '''
     def create_grid(self, r1, r2, r1p, h, w, xc, yc):
         grid = torch.zeros((h, w, 2))
         for xp in range(w):
             for yp in range(h):
-                r3p = math.dist((xp, yp), (xc, yc))
-                if r3p == 0 or r3p >= r2:
-                    grid[yp, xp, 0] = xp
-                    grid[yp, xp, 1] = yp
-                elif r3p > r1p and r3p < r2:
-                    x, y = self.find_xy_between(r1, r2, r1p, r3p, xp, yp, xc, yc)
-                    grid[yp, xp, 0] = x
-                    grid[yp, xp, 1] = y
-                else:
-                    x, y = self.find_xy_less(r1, r1p, xp, yp, xc, yc)
-                    grid[yp, xp, 0] = x
-                    grid[yp, xp, 1] = y
-        grid = grid.unsqueeze(0)
-        return grid
+                #r3p = math.dist((xp, yp), (xc, yc))
+                #if r3p == 0 or r3p >= r2:
+                grid[yp, xp, 0] = xp
+                grid[yp, xp, 1] = yp
+                #elif r3p > r1p and r3p < r2:
+                #    x, y = self.find_xy_between(r1, r2, r1p, r3p, xp, yp, xc, yc)
+                #    grid[yp, xp, 0] = x
+                #    grid[yp, xp, 1] = y
+                #else:
+                #    x, y = self.find_xy_less(r1, r1p, xp, yp, xc, yc)
+                #    grid[yp, xp, 0] = x
+                #    grid[yp, xp, 1] = y
+       #grid = grid.unsqueeze(0)
+       # print(grid)
+
+        Y = torch.arange(0, h).reshape(1, h, 1).repeat(1, 1, w).float()
+        X = torch.arange(0, w).reshape(1, 1, w).repeat(1, h, 1).float()
+
+        no_change = torch.cat((X.unsqueeze(3), Y.unsqueeze(3)), dim=3)
+
+        #print(torch.sum(grid - no_change))
+
+        return no_change
+    '''
+    def create_grid(self, r1, r2, r1p, b, h, w, xc, yc): # batched implementation
+        Y = torch.arange(0, h).reshape(1, h, 1).repeat(b, 1, w).float()
+        X = torch.arange(0, w).reshape(1, 1, w).repeat(b, h, 1).float()
+
+        r3p = torch.sqrt((X - xc) ** 2 + (Y - yc) ** 2) #(b,h,w)
+        r1r = r1.reshape(-1, 1, 1).repeat(1, h, w)
+        r2r = r2.reshape(-1, 1, 1).repeat(1, h, w)
+        r1pr = r1p.reshape(-1, 1, 1).repeat(1, h, w)
+        xcr = xc.reshape(-1, 1, 1).repeat(1, h, w)
+        ycr = yc.reshape(-1, 1, 1).repeat(1, h, w)
+
+        no_change_cond = torch.where(r3p >= r2r, 1, 0).unsqueeze(3).repeat(1,1,1,2)
+        no_change = torch.cat((X.unsqueeze(3), Y.unsqueeze(3)), dim=3)
+        xy_between_cond = torch.where(torch.logical_and(r3p > r1pr, r3p < r2r), 1, 0).unsqueeze(3).repeat(1,1,1,2)
+        x_between, y_between = self.find_xy_between(r1r, r2r, r1pr, r3p, X, Y, xcr, ycr)
+        xy_between = torch.cat((x_between.unsqueeze(3), y_between.unsqueeze(3)), dim=3)
+
+        xy_less_cond = torch.where(r3p <= r1pr, 1, 0).unsqueeze(3).repeat(1,1,1,2)
+        x_less, y_less = self.find_xy_less(r1r, r1pr, X, Y, xcr, ycr)
+        xy_less = torch.cat((x_less.unsqueeze(3), y_less.unsqueeze(3)), dim=3)
+
+        grid = (no_change_cond * no_change + xy_between_cond * xy_between + xy_less_cond * xy_less).float()
+
+        return grid, np.uint8((r3p > r1pr).numpy()[0])
     
     def deform(self, input, grid, interp_mode):  #helper function
     
@@ -195,18 +229,20 @@ class LinearDeformer(object):
     
     def linear_deform(self, image, alpha):
         pupil_xyr, iris_xyr = self.circApprox(image)
-        xc = (pupil_xyr[0] + iris_xyr[0])/2
-        yc = (pupil_xyr[1] + iris_xyr[1])/2
-        r1 = pupil_xyr[2]
-        r2 = iris_xyr[2]
-        r1p = r2 * alpha
+        xc = torch.tensor((pupil_xyr[0] + iris_xyr[0])/2).unsqueeze(0).float()
+        yc = torch.tensor((pupil_xyr[1] + iris_xyr[1])/2).unsqueeze(0).float()
+        r1 = torch.tensor(pupil_xyr[2]).unsqueeze(0).float()
+        r2 = torch.tensor(iris_xyr[2]).unsqueeze(0).float()
+        r1p = r2 * torch.tensor(alpha).unsqueeze(0).float()
         image = ToTensor()(image).unsqueeze(0) * 255
         w = image.shape[3]
         h = image.shape[2]
-        newgrid = self.create_grid(r1, r2, r1p, h, w, xc, yc)
+        newgrid, pupil_mask = self.create_grid(r1, r2, r1p, 1, h, w, xc, yc)
+        #print(newgrid)
+        #torch.save(newgrid, 'newgrid.pt')
         deformed_image = self.deform(image, newgrid, interp_mode='bilinear')
         deformed_image = torch.clamp(torch.round(deformed_image), min=0, max=255)
-        return Image.fromarray(deformed_image[0][0].cpu().numpy().astype(np.uint8), 'L')
+        return Image.fromarray(deformed_image[0][0].cpu().numpy().astype(np.uint8) * pupil_mask, 'L')
     
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -227,5 +263,5 @@ if __name__ == '__main__':
 
     linearDeformer = LinearDeformer(net_path=args.net_path, device=device)
     image_pil = Image.fromarray(np.array(Image.open(args.image_path).convert('RGB'))[:, :, 0], 'L')
-    deformed_image = linearDeformer.linear_deform(image_pil, 0.5)
+    deformed_image = linearDeformer.linear_deform(image_pil, 0.6)
     deformed_image.save(os.path.join(args.save_dir, os.path.split(args.image_path)[1]))
